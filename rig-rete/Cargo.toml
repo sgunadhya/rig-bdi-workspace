@@ -1,0 +1,16 @@
+[package]
+name = "rig-rete"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig-effects = { path = "../rig-effects", default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+rig-rete-derive = { path = "../rig-rete-derive", optional = true }
+
+[features]
+default = ["derive"]
+derive = ["dep:rig-rete-derive"]
+
+[dev-dependencies]
+serde_json = "1"

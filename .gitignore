@@ -1,0 +1,14 @@
+/target
+**/target
+
+# Local runtime artifacts
+incidents.db
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+
+# Tauri build artifacts
+src-tauri/target

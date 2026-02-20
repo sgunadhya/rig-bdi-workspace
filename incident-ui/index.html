@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Incident Agent Validator</title>
+    <link data-trunk rel="rust" />
+    <style>
+      :root {
+        --bg: #1e1e2e;
+        --panel: #313244;
+        --text: #cdd6f4;
+        --subtext: #a6adc8;
+        --accent: #89b4fa;
+        --accent-2: #94e2d5;
+        --mutate: #fab387;
+        --err: #f38ba8;
+        --ok: #a6e3a1;
+        --surface: #45475a;
+      }
+      body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: radial-gradient(circle at top, #181825, var(--bg)); color: var(--text); }
+      .layout { display: grid; grid-template-columns: 300px 1fr 420px; gap: 12px; padding: 12px; height: 100vh; box-sizing: border-box; }
+      .panel { background: var(--panel); border-radius: 10px; padding: 12px; overflow: auto; }
+      h2 { margin: 0 0 10px; font-size: 14px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+      h3 { margin: 8px 0; font-size: 12px; }
+      button { background: var(--surface); color: var(--text); border: 1px solid #585b70; border-radius: 8px; padding: 8px 10px; cursor: pointer; }
+      input { background: #181825; color: var(--text); border: 1px solid #585b70; border-radius: 6px; padding: 6px; width: 100%; box-sizing: border-box; }
+      ul { list-style: none; padding: 0; margin: 0; }
+      li { padding: 8px; border-bottom: 1px solid rgba(255,255,255,.08); cursor: pointer; }
+      .step { display: flex; justify-content: space-between; gap: 8px; }
+      .badge { font-size: 11px; border-radius: 20px; padding: 2px 8px; }
+      .observe { background: #89b4fa; color: #11111b; }
+      .mutate { background: var(--mutate); color: #111; }
+      .irreversible { background: #f38ba8; color: #11111b; }
+      .pure { background: var(--accent-2); color: #11111b; }
+      .ok { color: var(--ok); }
+      .warn { color: var(--err); }
+      .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .metric { background: #45475a; border-radius: 8px; padding: 8px; }
+      .meta { color: var(--subtext); font-size: 11px; }
+      .stack { display: grid; gap: 8px; margin-bottom: 10px; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .error { white-space: pre-wrap; color: #ffb0a8; }
+    </style>
+  </head>
+  <body></body>
+</html>

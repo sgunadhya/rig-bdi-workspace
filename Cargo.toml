@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "fact-registry",
+    "rig-effects",
+    "rig-effects-derive",
+    "agent-core",
+    "agent-server",
+    "src-tauri",
+    "incident-ui",
+]
