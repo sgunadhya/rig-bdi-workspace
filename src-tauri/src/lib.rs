@@ -53,10 +53,13 @@ pub fn run_tauri() {
             commands::get_timeline_cmd,
             commands::get_current_plan_cmd,
             commands::get_tool_calls_cmd,
+            commands::get_suggested_facts_cmd,
             commands::respond_to_escalation_cmd,
             commands::upsert_alert_fact_cmd,
             commands::retract_fact_cmd,
-            commands::reprocess_incident_cmd
+            commands::reprocess_incident_cmd,
+            commands::generate_fact_suggestions_cmd,
+            commands::decide_fact_suggestion_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

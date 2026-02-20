@@ -1,6 +1,7 @@
 use crate::state::{AppState, EscalationResponse};
 use agent_core::event_log::{Event, EventType};
 use agent_core::facts::{AlertFact, AlertSource, Fact, Severity};
+use agent_core::llm;
 use agent_core::{executor, planner, rules, runbooks};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,6 +56,17 @@ pub struct ToolCallDto {
     pub status: String,
     pub effect: String,
     pub summary: String,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuggestedFactDto {
+    pub suggestion_event_id: i64,
+    pub fact_id: String,
+    pub summary: String,
+    pub severity: String,
+    pub tags: Vec<String>,
+    pub rationale: String,
     pub timestamp: String,
 }
 
@@ -180,6 +192,180 @@ pub fn get_tool_calls(state: &AppState, incident_id: String) -> Result<Vec<ToolC
     }
 
     Ok(out)
+}
+
+pub fn get_suggested_facts(
+    state: &AppState,
+    incident_id: String,
+) -> Result<Vec<SuggestedFactDto>, String> {
+    let events = state.log.events_for_incident(&incident_id)?;
+    let mut active: BTreeMap<i64, SuggestedFactDto> = BTreeMap::new();
+
+    for e in events {
+        match e.event_type {
+            EventType::FactSuggested => {
+                let Some(id) = e.id else {
+                    continue;
+                };
+                let Some(details) = e.details else {
+                    continue;
+                };
+                active.insert(
+                    id,
+                    SuggestedFactDto {
+                        suggestion_event_id: id,
+                        fact_id: details
+                            .get("fact_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("suggested")
+                            .to_string(),
+                        summary: details
+                            .get("title")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Suggested fact")
+                            .to_string(),
+                        severity: details
+                            .get("severity")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("high")
+                            .to_string(),
+                        tags: details
+                            .get("tags")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|xs| {
+                                xs.iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        rationale: details
+                            .get("rationale")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("llm suggestion")
+                            .to_string(),
+                        timestamp: e.timestamp,
+                    },
+                );
+            }
+            EventType::FactSuggestionResolved => {
+                if let Some(details) = e.details {
+                    if let Some(id) = details
+                        .get("suggestion_event_id")
+                        .and_then(serde_json::Value::as_i64)
+                    {
+                        active.remove(&id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(active.into_values().collect())
+}
+
+pub fn generate_fact_suggestions(state: &AppState, incident_id: String) -> Result<(), String> {
+    let facts = materialize_fact_map(state.log.events_for_incident(&incident_id)?);
+    let current_facts = facts.into_values().map(|(f, _)| f).collect::<Vec<_>>();
+    if current_facts.is_empty() {
+        return Err("no active facts for incident".into());
+    }
+
+    let llm_cfg = build_llm_config_from_env()
+        .ok_or_else(|| "LLM is not configured (missing API key env)".to_string())?;
+    let suggestions = llm::suggest_facts(&llm_cfg, &current_facts)?;
+
+    for s in suggestions {
+        state.log.append(&Event {
+            id: None,
+            incident_id: incident_id.clone(),
+            event_type: EventType::FactSuggested,
+            description: format!("llm suggested fact: {}", s.fact_id),
+            details: Some(serde_json::json!({
+                "fact_id": s.fact_id,
+                "title": s.title,
+                "severity": s.severity,
+                "tags": s.tags,
+                "rationale": s.rationale
+            })),
+            timestamp: now_string(),
+        })?;
+    }
+    Ok(())
+}
+
+pub fn decide_fact_suggestion(
+    state: &AppState,
+    incident_id: String,
+    suggestion_event_id: i64,
+    decision: String,
+) -> Result<(), String> {
+    let events = state.log.events_for_incident(&incident_id)?;
+    let suggested = events.into_iter().find(|e| {
+        e.id == Some(suggestion_event_id) && matches!(e.event_type, EventType::FactSuggested)
+    });
+    let Some(suggested) = suggested else {
+        return Err("suggestion event not found".into());
+    };
+
+    if decision.to_lowercase() == "approve" {
+        let Some(details) = suggested.details else {
+            return Err("suggestion payload missing".into());
+        };
+        let fact = Fact::Alert(AlertFact {
+            id: details
+                .get("fact_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("suggested")
+                .to_string(),
+            source: AlertSource::Generic,
+            severity: parse_severity(
+                details
+                    .get("severity")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("high"),
+            ),
+            title: details
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Suggested fact")
+                .to_string(),
+            tags: details
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            received_at: now_string(),
+        });
+        state.log.append(&Event {
+            id: None,
+            incident_id: incident_id.clone(),
+            event_type: EventType::FactAsserted,
+            description: "approved llm suggested fact".into(),
+            details: Some(serde_json::to_value(fact).map_err(|e| e.to_string())?),
+            timestamp: now_string(),
+        })?;
+    }
+
+    state.log.append(&Event {
+        id: None,
+        incident_id,
+        event_type: EventType::FactSuggestionResolved,
+        description: "fact suggestion resolved".into(),
+        details: Some(serde_json::json!({
+            "suggestion_event_id": suggestion_event_id,
+            "decision": decision
+        })),
+        timestamp: now_string(),
+    })?;
+
+    Ok(())
 }
 
 pub fn respond_to_escalation(
@@ -341,6 +527,15 @@ pub fn get_tool_calls_cmd(
 
 #[cfg(feature = "tauri-app")]
 #[tauri::command(rename_all = "camelCase")]
+pub fn get_suggested_facts_cmd(
+    state: tauri::State<'_, AppState>,
+    incident_id: String,
+) -> Result<Vec<SuggestedFactDto>, String> {
+    get_suggested_facts(&state, incident_id)
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command(rename_all = "camelCase")]
 pub fn respond_to_escalation_cmd(
     state: tauri::State<'_, AppState>,
     incident_id: String,
@@ -381,6 +576,26 @@ pub fn reprocess_incident_cmd(
     reprocess_incident(&state, incident_id)
 }
 
+#[cfg(feature = "tauri-app")]
+#[tauri::command(rename_all = "camelCase")]
+pub fn generate_fact_suggestions_cmd(
+    state: tauri::State<'_, AppState>,
+    incident_id: String,
+) -> Result<(), String> {
+    generate_fact_suggestions(&state, incident_id)
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command(rename_all = "camelCase")]
+pub fn decide_fact_suggestion_cmd(
+    state: tauri::State<'_, AppState>,
+    incident_id: String,
+    suggestion_event_id: i64,
+    decision: String,
+) -> Result<(), String> {
+    decide_fact_suggestion(&state, incident_id, suggestion_event_id, decision)
+}
+
 fn summarize_incident(state: &AppState, incident_id: String) -> Result<IncidentDto, String> {
     let events = state.log.events_for_incident(&incident_id)?;
 
@@ -408,6 +623,9 @@ fn summarize_incident(state: &AppState, incident_id: String) -> Result<IncidentD
                 current_phase = "human-response".into();
             }
             EventType::FactRetracted => {
+                current_phase = "matching".into();
+            }
+            EventType::FactSuggested | EventType::FactSuggestionResolved => {
                 current_phase = "matching".into();
             }
             EventType::PlanSelected => {
@@ -534,6 +752,22 @@ fn now_string() -> String {
         return "0".into();
     };
     duration.as_secs().to_string()
+}
+
+fn build_llm_config_from_env() -> Option<llm::LlmConfig> {
+    let api_key_env = std::env::var("LLM_API_KEY_ENV").unwrap_or_else(|_| "OPENAI_API_KEY".into());
+    if std::env::var(&api_key_env).is_err() {
+        return None;
+    }
+    Some(llm::LlmConfig {
+        provider: std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".into()),
+        model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+        api_key_env,
+        temperature: std::env::var("LLM_TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.2),
+    })
 }
 
 #[cfg(test)]
@@ -750,5 +984,47 @@ mod tests {
         let timeline = get_timeline(&state, "inc-r1".into()).expect("timeline");
         assert!(timeline.iter().any(|e| e.event_type == "PlanSelected"));
         assert!(timeline.iter().any(|e| e.event_type == "Resolved"));
+    }
+
+    #[test]
+    fn suggestion_lifecycle_tracks_pending_queue() {
+        let log = EventLog::open(&db_path("suggestion-lifecycle")).expect("open");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let state = AppState {
+            log: Arc::new(log),
+            decision_tx: tx,
+        };
+
+        state
+            .log
+            .append(&Event {
+                id: None,
+                incident_id: "inc-s1".into(),
+                event_type: EventType::FactSuggested,
+                description: "suggested".into(),
+                details: Some(serde_json::json!({
+                    "fact_id": "f1",
+                    "title": "suspected deploy regression",
+                    "severity": "high",
+                    "tags": ["deploy"],
+                    "rationale": "error spike after rollout"
+                })),
+                timestamp: "1".into(),
+            })
+            .expect("append suggested");
+
+        let pending = get_suggested_facts(&state, "inc-s1".into()).expect("pending");
+        assert_eq!(pending.len(), 1);
+
+        decide_fact_suggestion(
+            &state,
+            "inc-s1".into(),
+            pending[0].suggestion_event_id,
+            "reject".into(),
+        )
+        .expect("decide");
+
+        let pending_after = get_suggested_facts(&state, "inc-s1".into()).expect("pending after");
+        assert!(pending_after.is_empty());
     }
 }

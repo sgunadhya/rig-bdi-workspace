@@ -33,6 +33,15 @@ pub struct Interpretation {
     pub candidate_actions: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuggestedFact {
+    pub fact_id: String,
+    pub title: String,
+    pub severity: String,
+    pub tags: Vec<String>,
+    pub rationale: String,
+}
+
 pub fn interpret(
     config: &LlmConfig,
     recent_facts: &[Fact],
@@ -91,6 +100,18 @@ pub fn propose_and_validate(
     }
 
     Ok(selected)
+}
+
+pub fn suggest_facts(config: &LlmConfig, recent_facts: &[Fact]) -> Result<Vec<SuggestedFact>, String> {
+    let prompt = format!(
+        "Given current incident facts, propose up to 3 additional alert-like facts that would \
+         improve diagnosis. Return JSON only with schema: \
+         {{\"suggestions\":[{{\"fact_id\":\"string\",\"title\":\"string\",\"severity\":\"low|medium|high|critical\",\"tags\":[\"string\"],\"rationale\":\"string\"}}]}}.\n\
+         Facts:\n{}",
+        serde_json::to_string_pretty(recent_facts).map_err(|e| e.to_string())?
+    );
+    let raw = run_prompt(config, "You are an SRE incident assistant.", &prompt)?;
+    parse_suggested_facts(&raw)
 }
 
 fn run_prompt(config: &LlmConfig, preamble: &str, prompt: &str) -> Result<String, String> {
@@ -158,6 +179,52 @@ fn parse_action_list(raw: &str) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
+fn parse_suggested_facts(raw: &str) -> Result<Vec<SuggestedFact>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("invalid llm suggestions json: {e}"))?;
+    let arr = v
+        .get("suggestions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for item in arr {
+        out.push(SuggestedFact {
+            fact_id: item
+                .get("fact_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("suggested-fact")
+                .to_string(),
+            title: item
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Suggested fact")
+                .to_string(),
+            severity: item
+                .get("severity")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("high")
+                .to_string(),
+            tags: item
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            rationale: item
+                .get("rationale")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("llm suggestion")
+                .to_string(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +246,17 @@ mod tests {
         let raw = r#"{"actions":["inspect-pod-logs","rollback-deployment"]}"#;
         let parsed = parse_action_list(raw).expect("parse");
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_suggested_facts_json() {
+        let raw = r#"{
+          "suggestions": [
+            {"fact_id":"f1","title":"pod restarted", "severity":"high", "tags":["k8s"], "rationale":"recent restart spike"}
+          ]
+        }"#;
+        let parsed = parse_suggested_facts(raw).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].fact_id, "f1");
     }
 }

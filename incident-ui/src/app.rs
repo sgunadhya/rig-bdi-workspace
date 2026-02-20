@@ -1,6 +1,7 @@
 use crate::bridge;
 use crate::dto::{
-    EscalationResponse, FactDto, IncidentDto, PlanDto, PlanStepDto, TimelineEventDto, ToolCallDto,
+    EscalationResponse, FactDto, IncidentDto, PlanDto, PlanStepDto, SuggestedFactDto,
+    TimelineEventDto, ToolCallDto,
 };
 use leptos::*;
 use wasm_bindgen_futures::spawn_local;
@@ -29,6 +30,7 @@ pub fn App() -> impl IntoView {
         current_step: 0,
     });
     let tools = create_rw_signal(Vec::<ToolCallDto>::new());
+    let suggestions = create_rw_signal(Vec::<SuggestedFactDto>::new());
     let error = create_rw_signal(None::<String>);
 
     let fact_id = create_rw_signal(String::new());
@@ -59,6 +61,7 @@ pub fn App() -> impl IntoView {
             let bl = bridge::fetch_beliefs(&incident_id).await;
             let pl = bridge::fetch_plan(&incident_id).await;
             let tc = bridge::fetch_tool_calls(&incident_id).await;
+            let sf = bridge::fetch_suggested_facts(&incident_id).await;
             let mut errs = Vec::new();
 
             match tl {
@@ -89,6 +92,10 @@ pub fn App() -> impl IntoView {
             match tc {
                 Ok(v) => tools.set(v),
                 Err(e) => errs.push(format!("tool_calls: {e}")),
+            }
+            match sf {
+                Ok(v) => suggestions.set(v),
+                Err(e) => errs.push(format!("suggestions: {e}")),
             }
 
             if errs.is_empty() {
@@ -151,6 +158,16 @@ pub fn App() -> impl IntoView {
         if let Some(id) = selected.get_untracked() {
             spawn_local(async move {
                 let _ = bridge::reprocess_incident(&id).await;
+                load_incidents();
+                load_details(id);
+            });
+        }
+    };
+
+    let generate_suggestions = move || {
+        if let Some(id) = selected.get_untracked() {
+            spawn_local(async move {
+                let _ = bridge::generate_fact_suggestions(&id).await;
                 load_incidents();
                 load_details(id);
             });
@@ -298,6 +315,54 @@ pub fn App() -> impl IntoView {
                     <div class="meta">{t.summary}</div>
                   </li>
                 }
+              }
+            />
+          </ul>
+
+          <h3>"LLM Fact Suggestions"</h3>
+          <div class="row">
+            <button on:click=move |_| generate_suggestions()>"Generate Suggestions"</button>
+          </div>
+          <ul>
+            <For
+              each=move || suggestions.get()
+              key=|s| s.suggestion_event_id
+              children=move |s| view! {
+                <li>
+                  <div><b>{s.fact_id.clone()}</b> <span class="meta">{s.severity.clone()}</span></div>
+                  <div>{s.summary.clone()}</div>
+                  <div class="meta">{format!("{} | {}", s.tags.join(","), s.rationale)}</div>
+                  <div class="row">
+                    <button on:click={
+                      let selected = selected;
+                      let id = s.suggestion_event_id;
+                      move |_| {
+                        if let Some(inc) = selected.get_untracked() {
+                          let inc_for_rpc = inc.clone();
+                          spawn_local(async move {
+                            let _ = bridge::decide_fact_suggestion(&inc_for_rpc, id, "approve").await;
+                          });
+                          load_incidents();
+                          load_details(inc);
+                        }
+                      }
+                    }>"Approve"</button>
+                    <button on:click={
+                      let selected = selected;
+                      let id = s.suggestion_event_id;
+                      move |_| {
+                        if let Some(inc) = selected.get_untracked() {
+                          let inc_for_rpc = inc.clone();
+                          spawn_local(async move {
+                            let _ = bridge::decide_fact_suggestion(&inc_for_rpc, id, "reject").await;
+                          });
+                          load_incidents();
+                          load_details(inc);
+                        }
+                      }
+                    }>"Reject"</button>
+                  </div>
+                </li>
               }
             />
           </ul>

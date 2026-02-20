@@ -1,5 +1,6 @@
 use crate::dto::{
-    EscalationResponse, FactDto, IncidentDto, PlanDto, TimelineEventDto, ToolCallDto,
+    EscalationResponse, FactDto, IncidentDto, PlanDto, SuggestedFactDto, TimelineEventDto,
+    ToolCallDto,
 };
 use js_sys::{Function, Promise, Reflect};
 use serde::de::DeserializeOwned;
@@ -129,6 +130,34 @@ pub async fn reprocess_incident(incident_id: &str) -> Result<(), String> {
         "reprocess_incident_cmd",
         &serde_json::json!({
             "incidentId": incident_id
+        }),
+    )
+    .await
+}
+
+pub async fn fetch_suggested_facts(id: &str) -> Result<Vec<SuggestedFactDto>, String> {
+    call("get_suggested_facts_cmd", &serde_json::json!({ "incidentId": id })).await
+}
+
+pub async fn generate_fact_suggestions(id: &str) -> Result<(), String> {
+    call(
+        "generate_fact_suggestions_cmd",
+        &serde_json::json!({ "incidentId": id }),
+    )
+    .await
+}
+
+pub async fn decide_fact_suggestion(
+    id: &str,
+    suggestion_event_id: i64,
+    decision: &str,
+) -> Result<(), String> {
+    call(
+        "decide_fact_suggestion_cmd",
+        &serde_json::json!({
+            "incidentId": id,
+            "suggestionEventId": suggestion_event_id,
+            "decision": decision
         }),
     )
     .await

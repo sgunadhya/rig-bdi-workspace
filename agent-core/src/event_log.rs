@@ -8,6 +8,8 @@ use std::sync::Arc;
 pub enum EventType {
     FactAsserted,
     FactRetracted,
+    FactSuggested,
+    FactSuggestionResolved,
     PlanSelected,
     ActionIntent,
     ActionResult,

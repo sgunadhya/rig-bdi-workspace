@@ -54,6 +54,17 @@ pub struct ToolCallDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuggestedFactDto {
+    pub suggestion_event_id: i64,
+    pub fact_id: String,
+    pub summary: String,
+    pub severity: String,
+    pub tags: Vec<String>,
+    pub rationale: String,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EscalationResponse {
     Approve,
     Reject { reason: String },
