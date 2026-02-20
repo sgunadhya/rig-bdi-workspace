@@ -1,11 +1,11 @@
 use crate::facts::Fact;
 use crate::runbooks::ActionSchema;
 use futures::executor::block_on;
-use rig::client::{completion::CompletionClient, ProviderClient};
-use rig::completion::Prompt;
+use rig::client::ProviderClient;
+use rig::extractor::ExtractorBuilder;
 use rig::providers::openai;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::future::IntoFuture;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlmConfig {
@@ -26,14 +26,14 @@ impl Default for LlmConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Interpretation {
     pub hypothesis: String,
     pub goal: String,
     pub candidate_actions: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SuggestedFact {
     pub fact_id: String,
     pub title: String,
@@ -46,15 +46,27 @@ pub fn interpret(
     config: &LlmConfig,
     recent_facts: &[Fact],
 ) -> Result<Interpretation, String> {
-    let prompt = format!(
-        "Analyze the incident context and return JSON only.\n\
-         Schema: {{\"hypothesis\":\"string\",\"goal\":\"string\",\"candidate_actions\":[\"string\"]}}\n\
-         Facts:\n{}",
-        serde_json::to_string_pretty(recent_facts).map_err(|e| e.to_string())?
-    );
+    let facts_json = serde_json::to_string_pretty(recent_facts).map_err(|e| e.to_string())?;
+    let extracted: Interpretation = run_extract(
+        config,
+        "You are an incident interpreter. Infer likely incident hypothesis, goal, and candidate actions from facts.",
+        "Analyze the incident facts and return a structured interpretation.",
+        &[("facts_json", facts_json)],
+    )?;
 
-    let raw = run_prompt(config, "You are an incident interpreter.", &prompt)?;
-    parse_interpretation(&raw)
+    Ok(Interpretation {
+        hypothesis: if extracted.hypothesis.trim().is_empty() {
+            "unknown".into()
+        } else {
+            extracted.hypothesis
+        },
+        goal: if extracted.goal.trim().is_empty() {
+            "recovery_verified".into()
+        } else {
+            extracted.goal
+        },
+        candidate_actions: extracted.candidate_actions,
+    })
 }
 
 pub fn propose_and_validate(
@@ -64,25 +76,30 @@ pub fn propose_and_validate(
     candidate_actions: &[String],
     all_actions: &[ActionSchema],
 ) -> Result<Vec<ActionSchema>, String> {
-    let prompt = format!(
-        "Return JSON only.\n\
-         Schema: {{\"actions\":[\"string\"]}}\n\
-         hypothesis={hypothesis}\n\
-         goal={goal}\n\
-         candidate_actions={}\n\
-         available_actions={}",
-        serde_json::to_string(candidate_actions).map_err(|e| e.to_string())?,
-        serde_json::to_string(
-            &all_actions
-                .iter()
-                .map(|a| a.name.clone())
-                .collect::<Vec<_>>()
-        )
-        .map_err(|e| e.to_string())?
-    );
-
-    let raw = run_prompt(config, "You are an incident planner.", &prompt)?;
-    let names = parse_action_list(&raw)?;
+    let names = run_extract::<ProposedActions>(
+        config,
+        "You are an incident planner. Select executable action names from available actions.",
+        "Return structured action names ordered by execution priority.",
+        &[
+            ("hypothesis", hypothesis.to_string()),
+            ("goal", goal.to_string()),
+            (
+                "candidate_actions",
+                serde_json::to_string(candidate_actions).map_err(|e| e.to_string())?,
+            ),
+            (
+                "available_actions",
+                serde_json::to_string(
+                    &all_actions
+                        .iter()
+                        .map(|a| a.name.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|e| e.to_string())?,
+            ),
+        ],
+    )?
+    .actions;
 
     // LLM proposes, executor validates by intersection with known actions.
     let mut selected = Vec::new();
@@ -103,18 +120,25 @@ pub fn propose_and_validate(
 }
 
 pub fn suggest_facts(config: &LlmConfig, recent_facts: &[Fact]) -> Result<Vec<SuggestedFact>, String> {
-    let prompt = format!(
-        "Given current incident facts, propose up to 3 additional alert-like facts that would \
-         improve diagnosis. Return JSON only with schema: \
-         {{\"suggestions\":[{{\"fact_id\":\"string\",\"title\":\"string\",\"severity\":\"low|medium|high|critical\",\"tags\":[\"string\"],\"rationale\":\"string\"}}]}}.\n\
-         Facts:\n{}",
-        serde_json::to_string_pretty(recent_facts).map_err(|e| e.to_string())?
-    );
-    let raw = run_prompt(config, "You are an SRE incident assistant.", &prompt)?;
-    parse_suggested_facts(&raw)
+    let facts_json = serde_json::to_string_pretty(recent_facts).map_err(|e| e.to_string())?;
+    let out: SuggestedFactsEnvelope = run_extract(
+        config,
+        "You are an SRE incident assistant. Propose additional facts that increase confidence.",
+        "Suggest up to three additional alert-like facts that are useful next observations.",
+        &[("facts_json", facts_json)],
+    )?;
+    Ok(out.suggestions)
 }
 
-fn run_prompt(config: &LlmConfig, preamble: &str, prompt: &str) -> Result<String, String> {
+fn run_extract<T>(
+    config: &LlmConfig,
+    preamble: &str,
+    prompt: &str,
+    context: &[(&str, String)],
+) -> Result<T, String>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+{
     if config.provider.to_lowercase() != "openai" {
         return Err(format!("unsupported llm provider '{}'", config.provider));
     }
@@ -127,102 +151,29 @@ fn run_prompt(config: &LlmConfig, preamble: &str, prompt: &str) -> Result<String
         openai::Client::new(&api_key).map_err(|e| format!("openai client error: {e}"))?
     };
 
-    let agent = client
-        .agent(&config.model)
+    let mut builder: ExtractorBuilder<_, T> = client
+        .extractor::<T>(&config.model)
         .preamble(preamble)
-        .temperature(config.temperature)
-        .build();
+        .additional_params(serde_json::json!({ "temperature": config.temperature }));
 
-    let fut = agent.prompt(prompt).into_future();
-    let out: Result<String, _> = block_on(fut);
-    out.map_err(|e| format!("llm prompt failed: {e}"))
-}
-
-fn parse_interpretation(raw: &str) -> Result<Interpretation, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("invalid llm interpretation json: {e}"))?;
-    Ok(Interpretation {
-        hypothesis: v
-            .get("hypothesis")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-        goal: v
-            .get("goal")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("recovery_verified")
-            .to_string(),
-        candidate_actions: v
-            .get("candidate_actions")
-            .and_then(serde_json::Value::as_array)
-            .map(|xs| {
-                xs.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-    })
-}
-
-fn parse_action_list(raw: &str) -> Result<Vec<String>, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("invalid llm action-list json: {e}"))?;
-    Ok(v.get("actions")
-        .and_then(serde_json::Value::as_array)
-        .map(|xs| {
-            xs.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default())
-}
-
-fn parse_suggested_facts(raw: &str) -> Result<Vec<SuggestedFact>, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("invalid llm suggestions json: {e}"))?;
-    let arr = v
-        .get("suggestions")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    for item in arr {
-        out.push(SuggestedFact {
-            fact_id: item
-                .get("fact_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("suggested-fact")
-                .to_string(),
-            title: item
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Suggested fact")
-                .to_string(),
-            severity: item
-                .get("severity")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("high")
-                .to_string(),
-            tags: item
-                .get("tags")
-                .and_then(serde_json::Value::as_array)
-                .map(|xs| {
-                    xs.iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            rationale: item
-                .get("rationale")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("llm suggestion")
-                .to_string(),
-        });
+    for (name, value) in context {
+        builder = builder.context(&format!("{name}: {value}"));
     }
+
+    let extractor = builder.build();
+    let out = block_on(extractor.extract(prompt))
+        .map_err(|e| format!("llm extractor failed: {e}"))?;
     Ok(out)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct ProposedActions {
+    actions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct SuggestedFactsEnvelope {
+    suggestions: Vec<SuggestedFact>,
 }
 
 #[cfg(test)]
@@ -230,33 +181,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_interpretation_json() {
-        let raw = r#"{
-          "hypothesis":"memory pressure",
-          "goal":"recovery_verified",
-          "candidate_actions":["inspect-memory-metrics","tune-memory-limits"]
-        }"#;
-        let parsed = parse_interpretation(raw).expect("parse");
-        assert_eq!(parsed.goal, "recovery_verified");
-        assert_eq!(parsed.candidate_actions.len(), 2);
+    fn interpretation_struct_roundtrip() {
+        let value = Interpretation {
+            hypothesis: "memory pressure".into(),
+            goal: "recovery_verified".into(),
+            candidate_actions: vec!["inspect-memory-metrics".into(), "tune-memory-limits".into()],
+        };
+        let json = serde_json::to_string(&value).expect("json");
+        let back: Interpretation = serde_json::from_str(&json).expect("from json");
+        assert_eq!(back.goal, "recovery_verified");
+        assert_eq!(back.candidate_actions.len(), 2);
     }
 
     #[test]
-    fn parse_action_list_json() {
-        let raw = r#"{"actions":["inspect-pod-logs","rollback-deployment"]}"#;
-        let parsed = parse_action_list(raw).expect("parse");
-        assert_eq!(parsed.len(), 2);
+    fn proposed_actions_struct_roundtrip() {
+        let value = ProposedActions {
+            actions: vec!["inspect-pod-logs".into(), "rollback-deployment".into()],
+        };
+        let json = serde_json::to_string(&value).expect("json");
+        let back: ProposedActions = serde_json::from_str(&json).expect("from json");
+        assert_eq!(back.actions.len(), 2);
     }
 
     #[test]
-    fn parse_suggested_facts_json() {
-        let raw = r#"{
-          "suggestions": [
-            {"fact_id":"f1","title":"pod restarted", "severity":"high", "tags":["k8s"], "rationale":"recent restart spike"}
-          ]
-        }"#;
-        let parsed = parse_suggested_facts(raw).expect("parse");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].fact_id, "f1");
+    fn suggested_facts_struct_roundtrip() {
+        let value = SuggestedFactsEnvelope {
+            suggestions: vec![SuggestedFact {
+                fact_id: "f1".into(),
+                title: "pod restarted".into(),
+                severity: "high".into(),
+                tags: vec!["k8s".into()],
+                rationale: "recent restart spike".into(),
+            }],
+        };
+        let json = serde_json::to_string(&value).expect("json");
+        let back: SuggestedFactsEnvelope = serde_json::from_str(&json).expect("from json");
+        assert_eq!(back.suggestions.len(), 1);
+        assert_eq!(back.suggestions[0].fact_id, "f1");
     }
 }
