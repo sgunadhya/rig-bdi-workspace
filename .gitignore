@@ -12,3 +12,6 @@ incidents.db
 
 # Tauri build artifacts
 src-tauri/target
+
+# Generated frontend bundle (built from incident-ui via trunk)
+ui/
